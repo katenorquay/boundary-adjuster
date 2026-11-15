@@ -1,0 +1,22 @@
+{
+  "name": "shapefile-boundary-buffer",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Buffer zipped polygon shapefiles by one kilometre and compare the boundaries.",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "test": "node --test",
+    "buffer": "node script.js"
+  },
+  "dependencies": {
+    "@mapbox/shp-write": "0.4.3",
+    "@turf/buffer": "7.4.0",
+    "@turf/helpers": "7.4.0",
+    "@turf/union": "7.4.0",
+    "fflate": "0.8.3",
+    "shpjs": "6.2.0"
+  }
+}
