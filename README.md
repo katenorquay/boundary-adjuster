@@ -1,14 +1,15 @@
 # Shapefile boundary: add a 1 km buffer
 
 This Node.js script takes a ZIP containing a polygon shapefile, expands the area
-outward by **1,000 metres**, and exports the new boundary alongside the original.
-It also creates a standalone HTML comparison that works offline.
+outward by **1,000 metres**, and exports a single KML containing both the original
+and adjusted boundaries.
 
 ## Requirements
 
 - Node.js 22 or newer and npm. No Python, GDAL, GIS application, or API key needed.
-- One polygon layer in a ZIP, with matching `.shp`, `.shx`, `.dbf`, `.prj`, and
-  `.cpg` files. They can be inside a subfolder; extensions are case-insensitive.
+- One polygon layer in a ZIP, with matching `.shp`, `.shx`, `.dbf`, and `.prj`
+  files. A `.cpg` encoding file is optional. They can be inside a subfolder;
+  extensions are case-insensitive. Extra GeoJSON, KML, and KMZ exports are ignored.
 - A valid CRS definition in `.prj` that Proj4js supports. Coordinates are never
   assumed to be metres just because they are numbers.
 
@@ -28,13 +29,22 @@ Using the supplied sample:
 node script.js north_london_test_area_shapefile.zip
 ```
 
-Using your own ZIP and output directory (quote paths containing spaces):
+Using your own ZIP (quote paths containing spaces):
+
+```sh
+node script.js "/path/to/boundary.zip"
+```
+
+By default, results are saved in the **same directory as the input ZIP**.
+The KML name is derived automatically: `boundary.zip` becomes
+`boundary-adjusted-boundary.kml`. The original ZIP is not changed.
+
+To save results in a different directory:
 
 ```sh
 node script.js "/path/to/boundary.zip" --output "./my-results"
 ```
 
-By default, results go into `output/` relative to the terminal's current directory.
 Existing output files are not replaced unless you explicitly add `--overwrite`:
 
 ```sh
@@ -45,28 +55,25 @@ For usage, run `node script.js --help`. The distance is fixed at 1 km.
 
 ## Results
 
-| File in your output directory | Contents |
-| --- | --- |
-| `boundary_comparison.zip` | Two complete shapefile layers: `original` and `buffered`, each with `.shp`, `.shx`, `.dbf`, `.prj`, and `.cpg` companions. |
-| `comparison.html` | Offline visual comparison. Open in a browser; green is the original, blue is the expanded area. Checkboxes toggle either layer. No web server or internet required. |
-| `boundaries.geojson` | Both boundaries together in WGS84 longitude/latitude, with `kind` and `buffer_m` attributes for styling/filtering. |
+The only output is `<input-name>-adjusted-boundary.kml`. No ZIP, GeoJSON, or HTML
+files are generated. Files from previous runs are not deleted.
 
-**To view the shapefiles in QGIS or ArcGIS:** extract the output ZIP and add both
-`original.shp` and `buffered.shp`. Keep each layer's companion files together.
-Draw the original above the buffer, with different outline/fill colours. A shapefile
-does not store layer styling, so use the HTML preview for a ready-made comparison.
+Open the KML in Google Earth, QGIS, or another KML-compatible viewer:
 
-The original layer's five files are copied **byte-for-byte**, preserving its CRS,
-features, attribute data, and character encoding. The new buffered layer uses
-**WGS84 / EPSG:4326**, with a matching `.prj` and UTF-8 `.cpg`. GIS software can
-overlay the two CRSs automatically. This is intentionally not an export back into
-the input CRS.
+- **Original boundary**: green, with a placemark for each original feature.
+- **Adjusted boundary (+1 km)**: blue, with the dissolved, expanded area.
 
-The new layer has one Polygon/multipart Polygon record for the dissolved area,
-with `kind = buffered` and `buffer_m = 1000`. Source attributes are not assigned to
-the dissolved result; they remain on the original layer. GeoJSON comparison
-attributes `kind` and `buffer_m` override any source attributes with those names;
-the original shapefile's attributes are not changed.
+The two folders can be toggled independently. Polygon holes and disconnected
+parts are preserved. Coordinates use WGS84 longitude/latitude, clamped to ground;
+the KML is not exported in the input's projected CRS.
+
+Original feature attributes are included as KML extended data. The adjusted area
+has `kind = buffered` and `buffer_m = 1000`; source attributes are not assigned to
+the dissolved result. Comparison attributes `kind` and `buffer_m` override source
+attributes with those names in the KML only. The input ZIP remains unchanged.
+
+Without a `.cpg`, attribute text uses the shapefile reader's default decoding.
+Include a correct `.cpg` if non-ASCII text is decoded incorrectly.
 
 ## What “1 km boundary” means
 
@@ -100,13 +107,11 @@ those bounds. All components are processed in memory; use modest, trusted ZIPs,
 not very large or untrusted archives. Input topology should be valid; the script
 checks basic rings and coordinates but is not a full topology-repair tool.
 
-The preview uses a local display projection with north up, and no basemap. Its
-display transform is separate from the metric buffer calculation.
-
 ## Troubleshooting
 
-- **Missing or empty component:** put all five matching files in the ZIP. A `.prj`
-  is required to avoid silently using the wrong units or location.
+- **Missing or empty component:** include matching `.shp`, `.shx`, `.dbf`, and
+  `.prj` files in the ZIP. A `.prj` is required to avoid silently using the wrong
+  units or location. A `.cpg` is optional, but must be nonempty if supplied.
 - **More than one shapefile:** make a ZIP containing only the intended layer.
 - **Unsupported CRS/projection:** re-export the source with a Proj4js-supported
   CRS (for example EPSG:4326), including a correct `.prj`.
@@ -124,4 +129,5 @@ npm test
 ```
 
 Tests cover the supplied ZIP, projected input, buffer distance, holes/multipart
-round-tripping, required files, invalid input, and the command-line outputs.
+round-tripping, KML geometry and attributes, required files, invalid input, and
+the single-file command-line output.

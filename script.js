@@ -1,5 +1,5 @@
 import { readFile, mkdir, writeFile, access } from 'node:fs/promises';
-import { resolve, join } from 'node:path';
+import { resolve, join, dirname, basename, extname } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { parseArgs } from 'node:util';
 import { parseZip } from 'shpjs';
@@ -32,6 +32,7 @@ export async function readBoundary(bytes) {
 	const normalizedFiles = {};
 	for (const extension of EXTENSIONS) {
 		const content = files.get(`${stem}.${extension}`);
+		if (extension === 'cpg' && content === undefined) continue;
 		if (!content?.length) throw new Error(`Missing or empty .${extension} file matching ${stem}.shp.`);
 		originalFiles[`original.${extension}`] = content;
 		normalizedFiles[`input.${extension}`] = content;
@@ -137,6 +138,42 @@ export function createComparison(original, buffered) {
 	]);
 }
 
+export function createKml(comparison) {
+	validatePolygons(comparison);
+	const escapeXml = (value) => String(value ?? '').replace(/[&<>"']/g, (character) => ({
+		'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&apos;',
+	})[character]);
+	const polygonXml = (polygon) => `<Polygon><altitudeMode>clampToGround</altitudeMode>${polygon.map((ring, index) => {
+		const boundary = index === 0 ? 'outerBoundaryIs' : 'innerBoundaryIs';
+		const coordinates = orientRing(ring, index !== 0).map(([longitude, latitude]) => `${longitude},${latitude},0`).join(' ');
+		return `<${boundary}><LinearRing><coordinates>${coordinates}</coordinates></LinearRing></${boundary}>`;
+	}).join('')}</Polygon>`;
+	const folders = [
+		['buffered', 'Adjusted boundary (+1 km)'],
+		['original', 'Original boundary'],
+	].map(([kind, name]) => {
+		const placemarks = comparison.features.filter((feature) => feature.properties.kind === kind).map((feature, index) => {
+			const geometry = feature.geometry.type === 'Polygon'
+				? polygonXml(feature.geometry.coordinates)
+				: `<MultiGeometry>${feature.geometry.coordinates.map(polygonXml).join('')}</MultiGeometry>`;
+			const data = Object.entries(feature.properties).map(([key, value]) =>
+				`<Data name="${escapeXml(key)}"><value>${escapeXml(value)}</value></Data>`).join('');
+			return `<Placemark><name>${escapeXml(name)} ${index + 1}</name><styleUrl>#${kind}</styleUrl><ExtendedData>${data}</ExtendedData>${geometry}</Placemark>`;
+		}).join('\n');
+		return `<Folder><name>${escapeXml(name)}</name>${placemarks}</Folder>`;
+	}).join('\n');
+	return `<?xml version="1.0" encoding="UTF-8"?>
+<kml xmlns="http://www.opengis.net/kml/2.2">
+<Document>
+<name>Original and adjusted boundaries</name>
+<Style id="original"><LineStyle><color>ff537915</color><width>2</width></LineStyle><PolyStyle><color>66c5e4a7</color></PolyStyle></Style>
+<Style id="buffered"><LineStyle><color>ffeb6325</color><width>2</width></LineStyle><PolyStyle><color>55faa560</color></PolyStyle></Style>
+${folders}
+</Document>
+</kml>
+`;
+}
+
 export function createPreview(comparison) {
 	const polygonsOf = (geometry) => geometry.type === 'Polygon' ? [geometry.coordinates] : geometry.coordinates;
 	const positions = comparison.features.flatMap((feature) => polygonsOf(feature.geometry).flat(2));
@@ -215,38 +252,33 @@ export async function main(args = process.argv.slice(2)) {
 		args,
 		allowPositionals: true,
 		options: {
-			output: { type: 'string', short: 'o', default: 'output' },
+			output: { type: 'string', short: 'o' },
 			overwrite: { type: 'boolean', default: false },
 			help: { type: 'boolean', short: 'h', default: false },
 		},
 	});
 	if (values.help) {
-		console.log('Usage: node script.js <input.zip> [--output <directory>] [--overwrite]\n\nCreates a 1,000 m outward polygon buffer, a two-layer shapefile ZIP,\na GeoJSON comparison, and an offline HTML preview. See README.md.');
+		console.log('Usage: node script.js <input.zip> [--output <directory>] [--overwrite]\n\nCreates one KML containing the original boundary and a 1,000 m outward buffer.\nDefaults to the input directory; file is named <input-name>-adjusted-boundary.kml.\nSee README.md.');
 		return;
 	}
 	if (positionals.length !== 1) throw new Error('Provide exactly one input ZIP. Run node script.js --help for usage.');
-	const directory = resolve(values.output);
-	const names = ['boundary_comparison.zip', 'boundaries.geojson', 'comparison.html'];
+	const input = resolve(positionals[0]);
+	const directory = values.output === undefined ? dirname(input) : resolve(values.output);
+	const output = join(directory, `${basename(input, extname(input))}-adjusted-boundary.kml`);
 	if (!values.overwrite) {
-		for (const name of names) {
-			const exists = await access(join(directory, name)).then(() => true, (error) => {
-				if (error.code === 'ENOENT') return false;
-				throw error;
-			});
-			if (exists) throw new Error(`${join(directory, name)} already exists. Use --overwrite or choose another output directory.`);
-		}
+		const exists = await access(output).then(() => true, (error) => {
+			if (error.code === 'ENOENT') return false;
+			throw error;
+		});
+		if (exists) throw new Error(`${output} already exists. Use --overwrite or choose another output directory.`);
 	}
-	const { original, originalFiles } = await readBoundary(await readFile(resolve(positionals[0])));
+	const { original } = await readBoundary(await readFile(input));
 	const buffered = bufferBoundary(original);
 	const comparison = createComparison(original, buffered);
-	const archive = await createShapefileZip(originalFiles, buffered);
-	const preview = createPreview(comparison);
+	const kml = createKml(comparison);
 	await mkdir(directory, { recursive: true });
-	const outputs = [archive, JSON.stringify(comparison, null, 2), preview];
-	for (const [index, name] of names.entries()) {
-		await writeFile(join(directory, name), outputs[index], { flag: values.overwrite ? 'w' : 'wx' });
-		console.log(`Created ${join(directory, name)}`);
-	}
+	await writeFile(output, kml, { flag: values.overwrite ? 'w' : 'wx' });
+	console.log(`Created ${output}`);
 	console.log(`Buffered ${original.features.length} original feature(s) outward by ${DISTANCE_METRES} metres.`);
 }
 

@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { readFile, mkdtemp, readdir, rm } from 'node:fs/promises';
+import { readFile, writeFile, mkdir, mkdtemp, readdir, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -9,7 +9,7 @@ import shpWrite from '@mapbox/shp-write';
 import { parseZip } from 'shpjs';
 import { strToU8, unzipSync, zipSync } from 'fflate';
 import {
-  readBoundary, bufferBoundary, createShapefileZip, createComparison, createPreview,
+  readBoundary, bufferBoundary, createShapefileZip, createComparison, createPreview, createKml,
 } from './script.js';
 
 const sampleUrl = new URL('./north_london_test_area_shapefile.zip', import.meta.url);
@@ -21,6 +21,28 @@ const square = (west = -0.01, south = -0.01, east = 0.01, north = 0.01) =>
   [[west, south], [west, north], [east, north], [east, south], [west, south]];
 const feature = (coordinates, type = 'Polygon') => ({
   type: 'Feature', properties: { label: 'test' }, geometry: { type, coordinates },
+});
+
+test('archives without optional CPG accept companion exports and preserve original files', async () => {
+  const files = unzipSync(await fixture([square()]));
+  delete files['nested/AREA.CPG'];
+  const source = zipSync({
+    ...files,
+    'geo-export.geojson': strToU8(JSON.stringify(collection(feature([square()])))),
+    'geo-export.kml': strToU8('<kml/>'),
+    'geo-export.kmz': zipSync({ 'doc.kml': strToU8('<kml/>') }),
+  });
+  const { original, originalFiles } = await readBoundary(source);
+  assert.equal(original.features.length, 1);
+  const archive = await createShapefileZip(originalFiles, bufferBoundary(original));
+  const exported = unzipSync(archive);
+  assert.equal(Object.keys(exported).length, 9);
+  assert.equal(exported['original.cpg'], undefined);
+  assert.equal(new TextDecoder().decode(exported['buffered.cpg']), 'UTF-8');
+  for (const extension of ['shp', 'shx', 'dbf', 'prj']) {
+    assert.deepEqual(exported[`original.${extension}`], files[`nested/AREA.${extension.toUpperCase()}`]);
+  }
+  assert.equal((await parseZip(archive)).length, 2);
 });
 const collection = (...features) => ({ type: 'FeatureCollection', features });
 const polygonsOf = (geometry) => geometry.type === 'Polygon' ? [geometry.coordinates] : geometry.coordinates;
@@ -123,11 +145,12 @@ test('projected coordinates, nested folders, and uppercase extensions are suppor
 test('missing components and ambiguous archives fail clearly', async () => {
   const bytes = await fixture([square()]);
   const files = unzipSync(bytes);
-  for (const extension of ['SHP', 'SHX', 'DBF', 'PRJ', 'CPG']) {
+  for (const extension of ['SHP', 'SHX', 'DBF', 'PRJ']) {
     const incomplete = { ...files };
     delete incomplete[`nested/AREA.${extension}`];
     await assert.rejects(readBoundary(zipSync(incomplete)), /Missing or empty|exactly one/);
   }
+  await assert.rejects(readBoundary(zipSync({ ...files, 'nested/AREA.CPG': new Uint8Array() })), /Missing or empty .cpg/);
   await assert.rejects(readBoundary(zipSync({ ...files, 'extra.shp': files['nested/AREA.SHP'] })), /exactly one/);
   await assert.rejects(readBoundary(zipSync({ ...files, 'nested/AREA.PRJ': strToU8('not a CRS') }))); 
   await assert.rejects(readBoundary(strToU8('not a zip')));
@@ -144,24 +167,91 @@ test('empty, nonpolygon, invalid-coordinate, and over-wide input are rejected', 
   assert.throws(() => bufferBoundary(collection(feature([bad]))), /Invalid coordinates/);
 });
 
-test('CLI creates outputs, protects existing files, and reports errors', async () => {
+test('KML includes styled original and adjusted boundaries, holes, multipart geometry, and escaped attributes', () => {
+  const input = collection(feature([
+    [square(-0.15, -0.15, 0.15, 0.15), [...square(-0.08, -0.08, 0.08, 0.08)].reverse()],
+    [square(0.5, 0.5, 0.52, 0.52)],
+  ], 'MultiPolygon'));
+  input.features[0].properties = { 'label&"': '<site> & "field"' };
+  const buffered = bufferBoundary(input);
+  const comparison = createComparison(input, buffered);
+  const kml = createKml(comparison);
+  assert.match(kml, /xmlns="http:\/\/www.opengis.net\/kml\/2.2"/);
+  assert.equal((kml.match(/<Placemark>/g) ?? []).length, 2);
+  assert.equal((kml.match(/<MultiGeometry>/g) ?? []).length, 2);
+  assert.equal((kml.match(/<innerBoundaryIs>/g) ?? []).length, 2);
+  assert.match(kml, /<styleUrl>#original<\/styleUrl>/);
+  assert.match(kml, /<styleUrl>#buffered<\/styleUrl>/);
+  assert.match(kml, /<Data name="label&amp;&quot;"><value>&lt;site&gt; &amp; &quot;field&quot;<\/value><\/Data>/);
+  assert.match(kml, /<Data name="buffer_m"><value>1000<\/value><\/Data>/);
+  const coordinateLists = [...kml.matchAll(/<(outerBoundaryIs|innerBoundaryIs)><LinearRing><coordinates>([^<]+)<\/coordinates>/g)];
+  assert.equal(coordinateLists.length, 6);
+  for (const [index, [, boundary, text]] of coordinateLists.entries()) {
+    const ring = text.split(' ').map((point) => point.split(',').map(Number));
+    assert.ok(ring.every((point) => point.length === 3 && point.every(Number.isFinite) && point[2] === 0));
+    assert.deepEqual(ring[0], ring.at(-1));
+    const area = ring.slice(1).reduce((sum, point, i) =>
+      sum + ring[i][0] * point[1] - point[0] * ring[i][1], 0);
+    assert.equal(area > 0, boundary === 'outerBoundaryIs');
+    const expected = positionsOf(comparison.features[index < 3 ? 1 : 0].geometry);
+    for (const [longitude, latitude] of ring) {
+      assert.ok(expected.some((point) => point[0] === longitude && point[1] === latitude));
+    }
+  }
+});
+
+test('CLI creates only KML, protects existing files, and reports errors', async () => {
   const temporary = await mkdtemp(join(tmpdir(), 'boundary-buffer-'));
   try {
     const output = join(temporary, 'results');
-    const args = [scriptPath, fileURLToPath(sampleUrl), '--output', output];
+    const input = join(temporary, 'boundary.zip');
+    await writeFile(input, await fixture([square()]));
+    const args = [scriptPath, input, '--output', output];
     const run = (parameters) => spawnSync(process.execPath, parameters, { encoding: 'utf8', cwd: temporary });
     const first = run(args);
     assert.equal(first.status, 0, first.stderr);
-    assert.deepEqual((await readdir(output)).sort(), ['boundaries.geojson', 'boundary_comparison.zip', 'comparison.html']);
-    const geojson = JSON.parse(await readFile(join(output, 'boundaries.geojson'), 'utf8'));
-    assert.ok(geojson.features.some((item) => item.properties.kind === 'original'));
-    assert.ok(geojson.features.some((item) => item.properties.kind === 'buffered'));
+    assert.deepEqual(await readdir(output), ['boundary-adjusted-boundary.kml']);
+    const kml = await readFile(join(output, 'boundary-adjusted-boundary.kml'), 'utf8');
+    assert.match(kml, /<styleUrl>#original<\/styleUrl>/);
+    assert.match(kml, /<styleUrl>#buffered<\/styleUrl>/);
     assert.equal(run(args).status, 1);
     assert.equal(run([...args, '--overwrite']).status, 0);
     assert.equal(run([scriptPath, '--help']).status, 0);
     assert.equal(run([scriptPath]).status, 1);
     assert.equal(run([scriptPath, 'missing.zip']).status, 1);
     assert.equal(run([scriptPath, '--unknown']).status, 1);
+  } finally {
+    await rm(temporary, { recursive: true, force: true });
+  }
+});
+
+test('CLI defaults to the input directory and derives the KML name for absolute and relative paths', async () => {
+  const temporary = await mkdtemp(join(tmpdir(), 'boundary-buffer-'));
+  try {
+    const source = await fixture([square()]);
+    for (const useAbsolutePath of [true, false]) {
+      const folder = useAbsolutePath ? 'absolute input' : 'relative input';
+      const directory = join(temporary, folder);
+      await mkdir(directory);
+      const filename = 'my.boundary area.ZIP';
+      const input = join(directory, filename);
+      await writeFile(input, source);
+      const args = [scriptPath, useAbsolutePath ? input : join(folder, filename)];
+      const run = (parameters) => spawnSync(process.execPath, parameters, { encoding: 'utf8', cwd: temporary });
+      const first = run(args);
+      assert.equal(first.status, 0, first.stderr);
+      assert.deepEqual((await readdir(directory)).sort(), [
+        filename, 'my.boundary area-adjusted-boundary.kml',
+      ].sort());
+      const kml = await readFile(join(directory, 'my.boundary area-adjusted-boundary.kml'), 'utf8');
+      assert.equal((kml.match(/<Placemark>/g) ?? []).length, 2);
+      const repeat = run(args);
+      assert.equal(repeat.status, 1);
+      assert.match(repeat.stderr, /my\.boundary area-adjusted-boundary\.kml already exists/);
+      assert.equal(run([...args, '--overwrite']).status, 0);
+      assert.deepEqual(new Uint8Array(await readFile(input)), source);
+    }
+    assert.deepEqual((await readdir(temporary)).sort(), ['absolute input', 'relative input']);
   } finally {
     await rm(temporary, { recursive: true, force: true });
   }
