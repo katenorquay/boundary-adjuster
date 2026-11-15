@@ -4,6 +4,23 @@ This Node.js script takes a ZIP containing a polygon shapefile, expands the area
 outward by a chosen distance (**1,000 metres** by default), and exports a single
 KML containing both the original and adjusted boundaries.
 
+## Web app
+
+A React UI lets you drag in a ZIP, choose a buffer distance, preview the result,
+and download the KML. Everything runs in your browser; files are never uploaded.
+
+```sh
+npm run dev      # local development server
+npm run build    # production build into dist/
+```
+
+### Deploy (GitHub Pages, free)
+
+Pushing to `main` runs `.github/workflows/deploy.yml`, which tests, builds, and
+publishes the site. One-time setup: repo **Settings → Pages → Source: GitHub
+Actions**. The site is then at `https://<user>.github.io/boundary-adjuster/`.
+(Pages on private repos needs a paid GitHub plan.)
+
 ## Requirements
 
 - Node.js 22 or newer and npm. No Python, GDAL, GIS application, or API key needed.
