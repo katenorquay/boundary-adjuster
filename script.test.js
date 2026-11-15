@@ -8,7 +8,7 @@ import { spawnSync } from 'node:child_process';
 import shpWrite from '@mapbox/shp-write';
 import { strToU8, unzipSync, zipSync } from 'fflate';
 import {
-  readBoundary, bufferBoundary, createComparison, createKml,
+  readBoundary, bufferBoundary, createComparison, createKml, main,
 } from './script.js';
 
 const scriptPath = fileURLToPath(new URL('./script.js', import.meta.url));
@@ -69,6 +69,29 @@ test('buffer extends about 1,000 metres, rather than 1,000 degrees', () => {
   const closestCorner = [0.01, eastern[1] >= 0 ? 0.01 : -0.01];
   assert.ok(Math.abs(haversine(closestCorner, eastern) - 1000) < 1);
   assert.ok(eastern[0] > 0.018 && eastern[0] < 0.020);
+});
+
+test('custom buffer distances control the geometry and KML metadata', () => {
+  for (const distance of [250.5, 2000]) {
+    const original = collection(feature([square()]));
+    const buffered = bufferBoundary(original, distance);
+    const eastern = positionsOf(buffered.geometry).reduce((best, point) => point[0] > best[0] ? point : best);
+    const closestCorner = [0.01, eastern[1] >= 0 ? 0.01 : -0.01];
+    assert.ok(Math.abs(haversine(closestCorner, eastern) - distance) < 1);
+    const kml = createKml(createComparison(original, buffered));
+    assert.ok(kml.includes(`Adjusted boundary (+${distance} m)`));
+    assert.ok(kml.includes(`<Data name="buffer_m"><value>${distance}</value></Data>`));
+  }
+});
+
+test('invalid buffer distances fail before reading or writing files', async () => {
+  const original = collection(feature([square()]));
+  for (const distance of [0, -1, NaN, Infinity, -Infinity, '500', null]) {
+    assert.throws(() => bufferBoundary(original, distance), /positive, finite number of metres/);
+  }
+  for (const distance of ['0', '-1', 'NaN', 'Infinity', '-Infinity', 'abc', '', ' ']) {
+    await assert.rejects(main(['unused.zip', `--buffer=${distance}`]), /positive, finite number of metres/);
+  }
 });
 
 test('overlapping input polygons dissolve into one expanded area', () => {
@@ -171,16 +194,30 @@ test('CLI creates only KML, protects existing files, and reports errors', async 
     const output = join(temporary, 'results');
     const input = join(temporary, 'boundary.zip');
     await writeFile(input, await fixture([square()]));
-    const args = [scriptPath, input, '--output', output];
+    const args = [scriptPath, input, '--output', output, '--buffer', '250.5'];
     const run = (parameters) => spawnSync(process.execPath, parameters, { encoding: 'utf8', cwd: temporary });
     const first = run(args);
     assert.equal(first.status, 0, first.stderr);
-    assert.deepEqual(await readdir(output), ['boundary-adjusted-boundary.kml']);
-    const kml = await readFile(join(output, 'boundary-adjusted-boundary.kml'), 'utf8');
+    assert.deepEqual(await readdir(output), ['boundary-adjusted-boundary-250.5m.kml']);
+    const kmlPath = join(output, 'boundary-adjusted-boundary-250.5m.kml');
+    const kml = await readFile(kmlPath, 'utf8');
     assert.match(kml, /<styleUrl>#original<\/styleUrl>/);
     assert.match(kml, /<styleUrl>#buffered<\/styleUrl>/);
+    assert.match(kml, /Adjusted boundary \(\+250\.5 m\)/);
+    assert.match(kml, /<Data name="buffer_m"><value>250\.5<\/value><\/Data>/);
+    assert.match(first.stdout, /outward by 250\.5 metres/);
+    const coordinates = kml.match(/<styleUrl>#buffered<\/styleUrl>.*?<coordinates>([^<]+)<\/coordinates>/s)[1]
+      .split(' ').map((point) => point.split(',').map(Number));
+    const eastern = coordinates.reduce((best, point) => point[0] > best[0] ? point : best);
+    assert.ok(Math.abs(haversine([0.01, eastern[1] >= 0 ? 0.01 : -0.01], eastern) - 250.5) < 1);
     assert.equal(run(args).status, 1);
     assert.equal(run([...args, '--overwrite']).status, 0);
+    const differentBuffer = run([scriptPath, input, '--output', output, '--buffer', '500']);
+    assert.equal(differentBuffer.status, 0, differentBuffer.stderr);
+    assert.deepEqual((await readdir(output)).sort(), [
+      'boundary-adjusted-boundary-250.5m.kml', 'boundary-adjusted-boundary-500m.kml',
+    ]);
+    assert.equal(await readFile(kmlPath, 'utf8'), kml);
     assert.equal(run([scriptPath, '--help']).status, 0);
     assert.equal(run([scriptPath]).status, 1);
     assert.equal(run([scriptPath, 'missing.zip']).status, 1);
@@ -206,13 +243,14 @@ test('CLI defaults to the input directory and derives the KML name for absolute 
       const first = run(args);
       assert.equal(first.status, 0, first.stderr);
       assert.deepEqual((await readdir(directory)).sort(), [
-        filename, 'my.boundary area-adjusted-boundary.kml',
+        filename, 'my.boundary area-adjusted-boundary-1000m.kml',
       ].sort());
-      const kml = await readFile(join(directory, 'my.boundary area-adjusted-boundary.kml'), 'utf8');
+      const kml = await readFile(join(directory, 'my.boundary area-adjusted-boundary-1000m.kml'), 'utf8');
       assert.equal((kml.match(/<Placemark>/g) ?? []).length, 2);
+      assert.match(kml, /<Data name="buffer_m"><value>1000<\/value><\/Data>/);
       const repeat = run(args);
       assert.equal(repeat.status, 1);
-      assert.match(repeat.stderr, /my\.boundary area-adjusted-boundary\.kml already exists/);
+      assert.match(repeat.stderr, /my\.boundary area-adjusted-boundary-1000m\.kml already exists/);
       assert.equal(run([...args, '--overwrite']).status, 0);
       assert.deepEqual(new Uint8Array(await readFile(input)), source);
     }

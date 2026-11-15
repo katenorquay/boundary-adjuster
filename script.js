@@ -8,7 +8,7 @@ import union from '@turf/union';
 import { featureCollection } from '@turf/helpers';
 import { unzipSync, zipSync } from 'fflate';
 
-const DISTANCE_METRES = 1000;
+const DEFAULT_DISTANCE_METRES = 1000;
 const EXTENSIONS = ['shp', 'shx', 'dbf', 'prj', 'cpg'];
 
 /** Read one polygon layer, requiring a CRS rather than guessing coordinate units. */
@@ -75,7 +75,8 @@ function validatePolygons(collection) {
 }
 
 /** Dissolve internal borders, then expand the whole area (not a hollow ring). */
-export function bufferBoundary(original) {
+export function bufferBoundary(original, distanceMetres = DEFAULT_DISTANCE_METRES) {
+	validateDistance(distanceMetres);
 	validatePolygons(original);
 	const dissolved = original.features.length === 1
 		? original.features[0]
@@ -83,11 +84,17 @@ export function bufferBoundary(original) {
 	if (!dissolved) throw new Error('Could not dissolve the input polygons. Check their topology.');
 	// Turf projects to a local azimuthal-equidistant CRS in metres before using
 	// JSTS buffering, then transforms back to WGS84. Never buffer degree values.
-	const buffered = buffer(dissolved, DISTANCE_METRES, { units: 'meters', steps: 64 });
+	const buffered = buffer(dissolved, distanceMetres, { units: 'meters', steps: 64 });
 	if (!buffered?.geometry) throw new Error('Buffering produced no geometry. Check the input polygons.');
-	buffered.properties = { kind: 'buffered', buffer_m: DISTANCE_METRES };
+	buffered.properties = { kind: 'buffered', buffer_m: distanceMetres };
 	validatePolygons(featureCollection([buffered]));
 	return buffered;
+}
+
+function validateDistance(distanceMetres) {
+	if (!Number.isFinite(distanceMetres) || distanceMetres <= 0) {
+		throw new Error('Buffer distance must be a positive, finite number of metres.');
+	}
 }
 
 function orientRing(ring, clockwise) {
@@ -119,16 +126,17 @@ export function createKml(comparison) {
 		return `<${boundary}><LinearRing><coordinates>${coordinates}</coordinates></LinearRing></${boundary}>`;
 	}).join('')}</Polygon>`;
 	const folders = [
-		['buffered', 'Adjusted boundary (+1 km)'],
+		['buffered', 'Adjusted boundary'],
 		['original', 'Original boundary'],
 	].map(([kind, name]) => {
 		const placemarks = comparison.features.filter((feature) => feature.properties.kind === kind).map((feature, index) => {
+			const label = kind === 'buffered' ? `${name} (+${feature.properties.buffer_m} m)` : name;
 			const geometry = feature.geometry.type === 'Polygon'
 				? polygonXml(feature.geometry.coordinates)
 				: `<MultiGeometry>${feature.geometry.coordinates.map(polygonXml).join('')}</MultiGeometry>`;
 			const data = Object.entries(feature.properties).map(([key, value]) =>
 				`<Data name="${escapeXml(key)}"><value>${escapeXml(value)}</value></Data>`).join('');
-			return `<Placemark><name>${escapeXml(name)} ${index + 1}</name><styleUrl>#${kind}</styleUrl><ExtendedData>${data}</ExtendedData>${geometry}</Placemark>`;
+			return `<Placemark><name>${escapeXml(label)} ${index + 1}</name><styleUrl>#${kind}</styleUrl><ExtendedData>${data}</ExtendedData>${geometry}</Placemark>`;
 		}).join('\n');
 		return `<Folder><name>${escapeXml(name)}</name>${placemarks}</Folder>`;
 	}).join('\n');
@@ -149,19 +157,22 @@ export async function main(args = process.argv.slice(2)) {
 		args,
 		allowPositionals: true,
 		options: {
+			buffer: { type: 'string', default: String(DEFAULT_DISTANCE_METRES) },
 			output: { type: 'string', short: 'o' },
 			overwrite: { type: 'boolean', default: false },
 			help: { type: 'boolean', short: 'h', default: false },
 		},
 	});
 	if (values.help) {
-		console.log('Usage: node script.js <input.zip> [--output <directory>] [--overwrite]\n\nCreates one KML containing the original boundary and a 1,000 m outward buffer.\nDefaults to the input directory; file is named <input-name>-adjusted-boundary.kml.\nSee README.md.');
+		console.log(`Usage: node script.js <input.zip> [--buffer <metres>] [--output <directory>] [--overwrite]\n\nCreates one KML containing the original boundary and an outward buffer.\n--buffer must be a positive, finite number of metres (default: ${DEFAULT_DISTANCE_METRES}).\nDefaults to the input directory; file is named <input-name>-adjusted-boundary-<metres>m.kml.\nSee README.md.`);
 		return;
 	}
 	if (positionals.length !== 1) throw new Error('Provide exactly one input ZIP. Run node script.js --help for usage.');
+	const distanceMetres = Number(values.buffer);
+	validateDistance(distanceMetres);
 	const input = resolve(positionals[0]);
 	const directory = values.output === undefined ? dirname(input) : resolve(values.output);
-	const output = join(directory, `${basename(input, extname(input))}-adjusted-boundary.kml`);
+	const output = join(directory, `${basename(input, extname(input))}-adjusted-boundary-${distanceMetres}m.kml`);
 	if (!values.overwrite) {
 		const exists = await access(output).then(() => true, (error) => {
 			if (error.code === 'ENOENT') return false;
@@ -170,13 +181,13 @@ export async function main(args = process.argv.slice(2)) {
 		if (exists) throw new Error(`${output} already exists. Use --overwrite or choose another output directory.`);
 	}
 	const original = await readBoundary(await readFile(input));
-	const buffered = bufferBoundary(original);
+	const buffered = bufferBoundary(original, distanceMetres);
 	const comparison = createComparison(original, buffered);
 	const kml = createKml(comparison);
 	await mkdir(directory, { recursive: true });
 	await writeFile(output, kml, { flag: values.overwrite ? 'w' : 'wx' });
 	console.log(`Created ${output}`);
-	console.log(`Buffered ${original.features.length} original feature(s) outward by ${DISTANCE_METRES} metres.`);
+	console.log(`Buffered ${original.features.length} original feature(s) outward by ${distanceMetres} metres.`);
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {
