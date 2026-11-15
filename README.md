@@ -23,12 +23,6 @@ npm ci
 
 ## Run
 
-Using the supplied sample:
-
-```sh
-node script.js north_london_test_area_shapefile.zip
-```
-
 Using your own ZIP (quote paths containing spaces):
 
 ```sh
@@ -48,7 +42,7 @@ node script.js "/path/to/boundary.zip" --output "./my-results"
 Existing output files are not replaced unless you explicitly add `--overwrite`:
 
 ```sh
-node script.js north_london_test_area_shapefile.zip --overwrite
+node script.js "/path/to/boundary.zip" --overwrite
 ```
 
 For usage, run `node script.js --help`. The distance is fixed at 1 km.
@@ -128,6 +122,6 @@ Failures print an error and exit with a non-zero status.
 npm test
 ```
 
-Tests cover the supplied ZIP, projected input, buffer distance, holes/multipart
-round-tripping, KML geometry and attributes, required files, invalid input, and
-the single-file command-line output.
+Tests generate their own shapefile fixtures and cover projected input, buffer
+distance, holes/multipart geometry, KML attributes, required files, invalid input,
+and the single-file command-line output.

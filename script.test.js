@@ -6,13 +6,11 @@ import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { spawnSync } from 'node:child_process';
 import shpWrite from '@mapbox/shp-write';
-import { parseZip } from 'shpjs';
 import { strToU8, unzipSync, zipSync } from 'fflate';
 import {
-  readBoundary, bufferBoundary, createShapefileZip, createComparison, createPreview, createKml,
+  readBoundary, bufferBoundary, createComparison, createKml,
 } from './script.js';
 
-const sampleUrl = new URL('./north_london_test_area_shapefile.zip', import.meta.url);
 const scriptPath = fileURLToPath(new URL('./script.js', import.meta.url));
 const WGS84 = 'GEOGCS["WGS 84",DATUM["WGS_1984",SPHEROID["WGS 84",6378137,298.257223563]],PRIMEM["Greenwich",0],UNIT["degree",0.0174532925199433]]';
 const WEB_MERCATOR = 'PROJCS["WGS 84 / Pseudo-Mercator",GEOGCS["WGS 84",DATUM["WGS_1984",SPHEROID["WGS 84",6378137,298.257223563]],PRIMEM["Greenwich",0],UNIT["degree",0.0174532925199433]],PROJECTION["Mercator_1SP"],PARAMETER["central_meridian",0],PARAMETER["scale_factor",1],PARAMETER["false_easting",0],PARAMETER["false_northing",0],UNIT["metre",1],EXTENSION["PROJ4","+proj=merc +a=6378137 +b=6378137 +lat_ts=0 +lon_0=0 +x_0=0 +y_0=0 +k=1 +units=m +nadgrids=@null +wktext +no_defs"]]';
@@ -23,7 +21,7 @@ const feature = (coordinates, type = 'Polygon') => ({
   type: 'Feature', properties: { label: 'test' }, geometry: { type, coordinates },
 });
 
-test('archives without optional CPG accept companion exports and preserve original files', async () => {
+test('archives without optional CPG accept companion exports and generate KML', async () => {
   const files = unzipSync(await fixture([square()]));
   delete files['nested/AREA.CPG'];
   const source = zipSync({
@@ -32,17 +30,10 @@ test('archives without optional CPG accept companion exports and preserve origin
     'geo-export.kml': strToU8('<kml/>'),
     'geo-export.kmz': zipSync({ 'doc.kml': strToU8('<kml/>') }),
   });
-  const { original, originalFiles } = await readBoundary(source);
+  const original = await readBoundary(source);
   assert.equal(original.features.length, 1);
-  const archive = await createShapefileZip(originalFiles, bufferBoundary(original));
-  const exported = unzipSync(archive);
-  assert.equal(Object.keys(exported).length, 9);
-  assert.equal(exported['original.cpg'], undefined);
-  assert.equal(new TextDecoder().decode(exported['buffered.cpg']), 'UTF-8');
-  for (const extension of ['shp', 'shx', 'dbf', 'prj']) {
-    assert.deepEqual(exported[`original.${extension}`], files[`nested/AREA.${extension.toUpperCase()}`]);
-  }
-  assert.equal((await parseZip(archive)).length, 2);
+  const kml = createKml(createComparison(original, bufferBoundary(original)));
+  assert.equal((kml.match(/<Placemark>/g) ?? []).length, 2);
 });
 const collection = (...features) => ({ type: 'FeatureCollection', features });
 const polygonsOf = (geometry) => geometry.type === 'Polygon' ? [geometry.coordinates] : geometry.coordinates;
@@ -71,30 +62,6 @@ function haversine(a, b) {
   return 6371008.8 * 2 * Math.atan2(Math.sqrt(h), Math.sqrt(1 - h));
 }
 
-test('supplied sample buffers and exports complete, readable shapefile layers', async () => {
-  const source = await readFile(sampleUrl);
-  const { original, originalFiles } = await readBoundary(source);
-  const buffered = bufferBoundary(original);
-  assert.equal(buffered.properties.buffer_m, 1000);
-  const archive = await createShapefileZip(originalFiles, buffered);
-  const files = unzipSync(archive);
-  assert.equal(Object.keys(files).length, 10);
-  for (const [name, bytes] of Object.entries(originalFiles)) assert.deepEqual(files[name], bytes);
-  const layers = await parseZip(archive);
-  assert.equal(layers.length, 2);
-  const expanded = layers.find((layer) => layer.fileName === 'buffered');
-  assert.equal(expanded.features.length, 1);
-  assert.equal(expanded.features[0].properties.buffer_m, 1000);
-  assert.equal(new TextDecoder().decode(files['buffered.cpg']), 'UTF-8');
-  const comparison = createComparison(original, buffered);
-  const html = createPreview(comparison);
-  assert.match(html, /id="original"/);
-  assert.match(html, /id="buffered"/);
-  assert.match(html, /data-layer="original"/);
-  assert.match(html, /data-layer="buffered"/);
-  assert.doesNotMatch(html, /NaN|Infinity|<script src=/);
-});
-
 test('buffer extends about 1,000 metres, rather than 1,000 degrees', () => {
   const buffered = bufferBoundary(collection(feature([square()])));
   const positions = positionsOf(buffered.geometry);
@@ -113,15 +80,13 @@ test('overlapping input polygons dissolve into one expanded area', () => {
   assert.deepEqual(input.features[0].properties, { label: 'test' });
 });
 
-test('multipart polygons and surviving holes round-trip through the writer', async () => {
+test('buffer preserves disconnected polygons and shrinks surviving holes', () => {
   const input = collection(feature([
     [square(-0.15, -0.15, 0.15, 0.15), [...square(-0.08, -0.08, 0.08, 0.08)].reverse()],
     [square(0.5, 0.5, 0.52, 0.52)],
   ], 'MultiPolygon'));
   const buffered = bufferBoundary(input);
-  const archive = await createShapefileZip({}, buffered);
-  const result = await parseZip(archive);
-  const polygons = polygonsOf(result.features[0].geometry);
+  const polygons = polygonsOf(buffered.geometry);
   assert.equal(polygons.length, 2);
   assert.equal(polygons.filter((polygon) => polygon.length === 2).length, 1);
   const hole = polygons.find((polygon) => polygon.length === 2)[1];
@@ -134,7 +99,7 @@ test('projected coordinates, nested folders, and uppercase extensions are suppor
     6378137 * Math.log(Math.tan(Math.PI / 4 + latitude * Math.PI / 360)),
   ];
   const source = await fixture([square(-0.15, 51.5, -0.13, 51.52).map(toMercator)], WEB_MERCATOR);
-  const { original } = await readBoundary(source);
+  const original = await readBoundary(source);
   const point = original.features[0].geometry.coordinates[0][0];
   assert.ok(Math.abs(point[0] + 0.15) < 1e-8);
   assert.ok(Math.abs(point[1] - 51.5) < 1e-8);

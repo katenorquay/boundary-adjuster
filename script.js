@@ -3,15 +3,13 @@ import { resolve, join, dirname, basename, extname } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { parseArgs } from 'node:util';
 import { parseZip } from 'shpjs';
-import shpWrite from '@mapbox/shp-write';
 import buffer from '@turf/buffer';
 import union from '@turf/union';
 import { featureCollection } from '@turf/helpers';
-import { unzipSync, zipSync, strToU8 } from 'fflate';
+import { unzipSync, zipSync } from 'fflate';
 
 const DISTANCE_METRES = 1000;
 const EXTENSIONS = ['shp', 'shx', 'dbf', 'prj', 'cpg'];
-const WGS84 = 'GEOGCS["WGS 84",DATUM["WGS_1984",SPHEROID["WGS 84",6378137,298.257223563]],PRIMEM["Greenwich",0],UNIT["degree",0.0174532925199433]]';
 
 /** Read one polygon layer, requiring a CRS rather than guessing coordinate units. */
 export async function readBoundary(bytes) {
@@ -28,20 +26,18 @@ export async function readBoundary(bytes) {
 		throw new Error(`Expected exactly one shapefile layer in the ZIP; found ${shapes.length}.`);
 	}
 	const stem = shapes[0].slice(0, -4);
-	const originalFiles = {};
 	const normalizedFiles = {};
 	for (const extension of EXTENSIONS) {
 		const content = files.get(`${stem}.${extension}`);
 		if (extension === 'cpg' && content === undefined) continue;
 		if (!content?.length) throw new Error(`Missing or empty .${extension} file matching ${stem}.shp.`);
-		originalFiles[`original.${extension}`] = content;
 		normalizedFiles[`input.${extension}`] = content;
 	}
 	// parseZip rejects unknown projections; the object-based reader can silently
 	// fall back to unprojected coordinates when a .prj cannot be parsed.
 	const original = await parseZip(zipSync(normalizedFiles));
 	validatePolygons(original);
-	return { original, originalFiles };
+	return original;
 }
 
 function validatePolygons(collection) {
@@ -94,7 +90,6 @@ export function bufferBoundary(original) {
 	return buffered;
 }
 
-/** Shapefile exteriors must be clockwise; holes must be counterclockwise. */
 function orientRing(ring, clockwise) {
 	const area = ring.slice(1).reduce((sum, point, index) => {
 		const previous = ring[index];
@@ -103,32 +98,7 @@ function orientRing(ring, clockwise) {
 	return (area < 0) === clockwise ? ring : [...ring].reverse();
 }
 
-export async function createShapefileZip(originalFiles, buffered) {
-	const polygons = buffered.geometry.type === 'Polygon'
-		? [buffered.geometry.coordinates]
-		: buffered.geometry.coordinates;
-	const rings = polygons.flatMap((polygon) => polygon.map((ring, index) => orientRing(ring, index === 0)));
-	// One multipart record avoids a writer limitation that can overwrite layers
-	// when a collection mixes Polygon and MultiPolygon geometry types.
-	const files = await new Promise((resolveFiles, reject) => {
-		shpWrite.write([buffered.properties], 'POLYGON', [rings], (error, result) => {
-			if (error) reject(error);
-			else resolveFiles(result);
-		});
-	});
-	return zipSync({
-		...originalFiles,
-		'buffered.shp': new Uint8Array(files.shp.buffer),
-		'buffered.shx': new Uint8Array(files.shx.buffer),
-		'buffered.dbf': new Uint8Array(files.dbf.buffer),
-		'buffered.prj': strToU8(WGS84),
-		'buffered.cpg': strToU8('UTF-8'),
-	});
-}
-
 export function createComparison(original, buffered) {
-	// Both layers here use WGS84. The original shapefile bytes in the ZIP retain
-	// the source CRS and attributes, including their original character encoding.
 	return featureCollection([
 		...original.features.map((feature) => ({
 			...feature,
@@ -174,79 +144,6 @@ ${folders}
 `;
 }
 
-export function createPreview(comparison) {
-	const polygonsOf = (geometry) => geometry.type === 'Polygon' ? [geometry.coordinates] : geometry.coordinates;
-	const positions = comparison.features.flatMap((feature) => polygonsOf(feature.geometry).flat(2));
-	let west = Infinity, south = Infinity, east = -Infinity, north = -Infinity;
-	for (const [longitude, latitude] of positions) {
-		west = Math.min(west, longitude);
-		south = Math.min(south, latitude);
-		east = Math.max(east, longitude);
-		north = Math.max(north, latitude);
-	}
-	// A local equirectangular view avoids stretching longitude at UK latitudes.
-	// This is a display transform only, not the buffer calculation.
-	const cosine = Math.cos((south + north) / 2 * Math.PI / 180);
-	const scale = Math.min(880 / ((east - west) * cosine), 580 / (north - south));
-	const x = (longitude) => (500 + (longitude - (west + east) / 2) * cosine * scale).toFixed(3);
-	const y = (latitude) => (330 - (latitude - (south + north) / 2) * scale).toFixed(3);
-	const paths = (kind) => comparison.features.filter((feature) => feature.properties.kind === kind)
-		.map((feature) => `<path d="${polygonsOf(feature.geometry).map((polygon) => polygon.map((ring) =>
-			ring.map(([longitude, latitude], index) => `${index ? 'L' : 'M'}${x(longitude)},${y(latitude)}`).join(' ') + ' Z'
-		).join(' ')).join(' ')}"/>`).join('\n');
-	return `<!doctype html>
-<html lang="en">
-<head>
-	<meta charset="utf-8">
-	<meta name="viewport" content="width=device-width, initial-scale=1">
-	<title>Boundary comparison · 1 km buffer</title>
-	<style>
-		:root { font-family: system-ui, sans-serif; color: #172f42; background: #eef3f8; }
-		body { max-width: 1120px; margin: auto; padding: 32px 20px; }
-		h1 { margin-bottom: 8px; letter-spacing: -.04em; font-size: clamp(26px, 4vw, 40px); }
-		p { color: #52677b; line-height: 1.6; }
-		.card { background: white; border: 1px solid #d5e0eb; border-radius: 20px; overflow: hidden; box-shadow: 0 12px 40px #172f420c; }
-		.controls { display: flex; flex-wrap: wrap; gap: 24px; padding: 20px 24px; border-bottom: 1px solid #e6edf4; }
-		label { cursor: pointer; display: flex; align-items: center; gap: 8px; }
-		input { accent-color: #2265cf; }
-		.swatch { width: 14px; height: 14px; border-radius: 4px; background: #60a5fa; border: 2px solid #2563eb; }
-		.green { background: #a7e4c5; border-color: #157953; }
-		svg { display: block; width: 100%; background: #fbfdff; }
-		path { stroke-width: 2; stroke-linejoin: round; fill-rule: evenodd; vector-effect: non-scaling-stroke; }
-		#buffered { fill: #60a5fa55; stroke: #2563eb; }
-		#original { fill: #a7e4c5b3; stroke: #157953; }
-		.note { font-size: 13px; }
-	</style>
-</head>
-<body>
-	<h1>A little more room. Exactly 1 km requested.</h1>
-	<p>The expanded area contains the original boundary plus a 1,000 metre outward buffer. Toggle either layer to compare.</p>
-	<div class="card">
-		<div class="controls">
-			<label><input type="checkbox" checked data-layer="original"><span class="swatch green"></span>Original boundary</label>
-			<label><input type="checkbox" checked data-layer="buffered"><span class="swatch"></span>Expanded boundary (+1 km)</label>
-		</div>
-		<svg viewBox="0 0 1000 660" role="img" aria-labelledby="map-title map-desc">
-			<title id="map-title">Original and expanded boundaries</title>
-			<desc id="map-desc">Green shows the original area; blue shows the area expanded by one kilometre. North is up.</desc>
-			<g id="buffered">${paths('buffered')}</g>
-			<g id="original">${paths('original')}</g>
-			<text x="956" y="36" text-anchor="middle" fill="#52677b" font-size="16">N ↑</text>
-		</svg>
-	</div>
-	<p class="note">Offline preview · no basemap or external services · local display projection, not a survey drawing.<br>
-	Buffering uses a local spherical projection; distance accuracy is approximate. Blue also fills inward from hole edges, shrinking holes.</p>
-	<script>
-		for (const input of document.querySelectorAll('input[data-layer]')) {
-			input.addEventListener('change', () => {
-				document.getElementById(input.dataset.layer).style.display = input.checked ? '' : 'none';
-			});
-		}
-	</script>
-</body>
-</html>`;
-}
-
 export async function main(args = process.argv.slice(2)) {
 	const { values, positionals } = parseArgs({
 		args,
@@ -272,7 +169,7 @@ export async function main(args = process.argv.slice(2)) {
 		});
 		if (exists) throw new Error(`${output} already exists. Use --overwrite or choose another output directory.`);
 	}
-	const { original } = await readBoundary(await readFile(input));
+	const original = await readBoundary(await readFile(input));
 	const buffered = bufferBoundary(original);
 	const comparison = createComparison(original, buffered);
 	const kml = createKml(comparison);
